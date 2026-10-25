@@ -1,6 +1,6 @@
 # mtsw-shot
 
-A flameshot-style screenshot tool for Wayland, built for niri first. It also works on any
+A screenshot and annotation tool for Wayland, built for niri first. It also works on any
 compositor with `wlr-layer-shell` and `wlr-screencopy` (sway, Hyprland, river, …).
 
 It is pure Rust, with no GTK/Qt and no system libraries needed at build time.
@@ -28,24 +28,45 @@ the interactive capture exits with status 1.
 
 ### Editor
 
-| Input | Action |
-|---|---|
-| Drag | Select a region. A click selects the niri window (or screen) under the pointer |
-| Drag inside / on handles | Move / resize the selection |
-| Toolbar or key | Pencil `P`, Line `D`, Arrow `A`, Rectangle `S`, Filled rectangle `R`, Ellipse `C`, Marker `M`, Text `T`, Pixelate `B`, Blur `Shift+B`, Counter `N`, Invert `I`, Move `Ctrl+M` |
-| Shift while drawing | Snap lines to 45°, make squares/circles |
-| Right click | Color wheel |
-| Scroll, `+`/`-` | Stroke thickness / text size |
-| `Space` | Side panel (palette, thickness slider) |
-| `Ctrl+Z`, `Ctrl+Shift+Z` | Undo / redo (`Ctrl+Delete` clears everything) |
-| Arrows / `Shift`+arrows | Move / resize the selection by 1 px |
-| `Ctrl+A`, `Ctrl+Shift+A` | Select everything / the current screen |
-| `Enter`, double click, middle click | Accept (runs `accept_actions`, default: copy) |
-| `Ctrl+C` `Ctrl+S` `Ctrl+P` `Ctrl+U` `Ctrl+O` | Copy, save, pin, upload, open with |
-| `Esc` | Close the wheel / finish text / cancel |
+| Input                                        | Action                                                                                                                                                                        |
+|----------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Drag                                         | Select a region. A click selects the niri window (or screen) under the pointer                                                                                                |
+| Drag inside / on handles                     | Move / resize the selection                                                                                                                                                   |
+| Toolbar or key                               | Pencil `P`, Line `D`, Arrow `A`, Rectangle `S`, Filled rectangle `R`, Ellipse `C`, Marker `M`, Text `T`, Pixelate `B`, Blur `Shift+B`, Counter `N`, Invert `I`, Move `Ctrl+M` |
+| Shift while drawing                          | Snap lines to 45°, make squares/circles                                                                                                                                       |
+| Right click                                  | Color wheel                                                                                                                                                                   |
+| Scroll, `+`/`-`                              | Stroke thickness / text size                                                                                                                                                  |
+| `Space`                                      | Side panel (palette, thickness slider)                                                                                                                                        |
+| `Ctrl+Z`, `Ctrl+Shift+Z`                     | Undo / redo (`Ctrl+Delete` clears everything)                                                                                                                                 |
+| Arrows / `Shift`+arrows                      | Move / resize the selection by 1 px                                                                                                                                           |
+| `Ctrl+A`, `Ctrl+Shift+A`                     | Select everything / the current screen                                                                                                                                        |
+| `Enter`, double click, middle click          | Accept (runs `accept_actions`, default: copy)                                                                                                                                 |
+| `Ctrl+C` `Ctrl+S` `Ctrl+P` `Ctrl+U` `Ctrl+O` | Copy, save, pin, upload, open with                                                                                                                                            |
+| `Esc`                                        | Close the wheel / finish text / cancel                                                                                                                                        |
 
 Pinned images: drag to move, scroll to zoom, `Ctrl`+scroll for opacity, `Ctrl+C`/`Ctrl+S`,
 and `Esc`/double click to close.
+
+## Installation (Nix)
+
+```nix
+# flake.nix
+inputs.mtsw-shot = {
+  url = "github:matswuuu/mtsw-shot";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+
+# home-manager
+imports = [ inputs.mtsw-shot.homeModules.mtsw-shot ];
+programs.mtsw-shot = {
+  enable = true;
+  settings = { accept_actions = [ "copy" ]; };  # written to config.json
+};
+```
+
+Other ways to use it: `nix run github:matswuuu/mtsw-shot`, the `overlays.default` overlay
+(which provides `pkgs.mtsw-shot`), and `nix develop` for a dev shell. Without Nix, run
+`cargo install --path .`.
 
 ## niri setup
 
@@ -73,15 +94,30 @@ validates yours. Unknown keys produce a warning.
 ```json
 {
   "accept_actions": ["copy", "save"],
-  "save": { "path": "~/Pictures/Screenshots", "filename": "%Y-%m-%d_%H-%M-%S", "format": "png" },
-  "drawing": { "color": "#ff0000", "thickness": 3, "font": "Inter" },
-  "colors": { "ui": "#740096", "overlay": "#00000088" },
+  "save": {
+    "path": "~/Pictures/Screenshots",
+    "filename": "%Y-%m-%d_%H-%M-%S",
+    "format": "png"
+  },
+  "drawing": {
+    "color": "#ff0000",
+    "thickness": 3,
+    "font": "Inter"
+  },
+  "colors": {
+    "ui": "#740096",
+    "overlay": "#00000088"
+  },
   "ui": {
     "buttons": ["pencil", "arrow", "rectangle", "text", "pixelate", "undo", "copy", "save", "exit"],
     "show_magnifier": true,
     "accept_on_select": false
   },
-  "shortcuts": { "pencil": "Q", "redo": ["Ctrl+Shift+Z", "Ctrl+Y"], "blur": "" },
+  "shortcuts": {
+    "pencil": "Q",
+    "redo": ["Ctrl+Shift+Z", "Ctrl+Y"],
+    "blur": ""
+  },
   "commands": {
     "upload": ["sh", "-c", "curl -sS -F 'file=@{file}' https://0x0.st"],
     "open": ["swappy", "-f", "{file}"],
@@ -94,8 +130,8 @@ validates yours. Unknown keys produce a warning.
 * `save.dialog_command`: a command that prints a chosen path, for example
   `["zenity", "--file-selection", "--save", "--filename={path}"]`. When it is empty, files are
   saved directly.
-* `commands.upload`: the last line of stdout is taken as the URL and copied to the clipboard.
-  **The default uploads to the public host 0x0.st**, so change it if you need privacy.
+* `commands.upload`: the last line of stdout is taken as the URL and copied to the clipboard. **The default uploads to
+  the public host 0x0.st**, so change it if you need privacy.
 * Shortcut keys use XKB keysym names (`Return`, `space`, `Left`, `plus`). They work on
   non-Latin layouts too.
 * The last color, thickness and region are remembered in `~/.local/state/mtsw-shot/state.json`.

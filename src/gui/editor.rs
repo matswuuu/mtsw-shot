@@ -1428,6 +1428,35 @@ mod tests {
         assert_eq!(geo, Rect::new(200.0, 150.0, 700.0, 350.0));
     }
 
+    /// Regression: the text cursor and zero-size filled rects used to trip a debug
+    /// assertion in tiny-skia's anti-aliased rect fill.
+    #[test]
+    fn thin_rects_do_not_panic() {
+        let cfg = Config::default();
+        let mut ed = Editor::new(&cfg, fake_shot(), vec![], Color::rgb(255, 0, 0), 3.0, None, None, false, None);
+        drag(&mut ed, Point::new(100.0, 100.0), Point::new(700.0, 500.0));
+        let mut pix = Pixmap::new(1280, 720).unwrap();
+        ed.perform(Action::Text);
+        for x in [200.3, 200.5, 200.7, 201.1] {
+            ed.pointer_motion(Point::new(x, 300.4), Some(0));
+            ed.button(BTN_LEFT, true);
+            ed.button(BTN_LEFT, false);
+            ed.render(&mut pix.as_mut(), 0);
+            let key = KeyPress { mods: Default::default(), names: vec![], text: Some("il|".into()), repeats: true };
+            ed.key(&key);
+            ed.render(&mut pix.as_mut(), 0);
+        }
+        ed.perform(Action::FilledRectangle);
+        ed.pointer_motion(Point::new(300.3, 300.6), Some(0));
+        ed.button(BTN_LEFT, true);
+        for d in [0.1, 0.4, 0.7, 1.3] {
+            ed.pointer_motion(Point::new(300.3 + d, 300.6 + d), Some(0));
+            ed.render(&mut pix.as_mut(), 0);
+        }
+        ed.button(BTN_LEFT, false);
+        ed.render(&mut pix.as_mut(), 0);
+    }
+
     #[test]
     fn click_selects_window() {
         let mut cfg = Config::default();

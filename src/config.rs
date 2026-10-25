@@ -472,7 +472,7 @@ impl Shortcut {
     }
 }
 
-/// Defaults follow flameshot's key bindings.
+/// Default key bindings.
 fn default_shortcuts() -> BTreeMap<Action, Shortcut> {
     use Action::*;
     let one = |s: &str| Shortcut::One(s.into());

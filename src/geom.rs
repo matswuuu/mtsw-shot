@@ -104,7 +104,7 @@ impl Rect {
         tiny_skia::Rect::from_xywh(self.x, self.y, self.w.max(0.001), self.h.max(0.001))
     }
 
-    /// Parses `WxH+X+Y` (X11 geometry style, as used by flameshot `--region`).
+    /// Parses `WxH+X+Y` (X11 geometry style, as used by `--region`).
     pub fn parse_geometry(s: &str) -> Option<Rect> {
         let (size, pos) = s.split_once('+').map(|(a, b)| (a, Some(b))).unwrap_or((s, None));
         let (w, h) = size.split_once('x')?;

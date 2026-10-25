@@ -655,6 +655,7 @@ dependencies = [
  "dirs",
  "image",
  "kbvm",
+ "libc",
  "serde",
  "serde_json",
  "smithay-client-toolkit",

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "mtsw-shot", version, about = "Flameshot-like screenshot tool for Wayland (niri first)")]
+#[command(name = "mtsw-shot", version, about = "Screenshot and annotation tool for Wayland (niri first)")]
 pub struct Cli {
     /// Use this config file instead of ~/.config/mtsw-shot/config.json.
     #[arg(long, global = true, value_name = "FILE")]
