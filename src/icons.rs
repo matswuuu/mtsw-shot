@@ -167,14 +167,34 @@ fn ops(action: Action) -> Vec<Op> {
     }
 }
 
+/// Eyedropper icon for the color picker.
+pub fn draw_eyedropper(target: &mut PixmapMut, x: f32, y: f32, size: f32, color: Color) {
+    let ops = vec![
+        Op::Fill(pb(|b| {
+            b.move_to(14.0, 4.0);
+            b.cubic_to(16.0, 2.0, 19.0, 2.0, 21.0, 4.0);
+            b.cubic_to(22.5, 5.5, 22.0, 8.5, 20.0, 10.0);
+            b.line_to(14.0, 4.0);
+            b.close();
+        })),
+        Op::Stroke(line(&[(12.0, 6.0), (18.0, 12.0)]), 2.0),
+        Op::Stroke(line(&[(15.0, 9.0), (6.0, 18.0), (4.0, 20.0)]), 2.0),
+    ];
+    draw_ops(target, ops, x, y, size, color);
+}
+
 /// Draws the icon for `action` into the square at (x, y) with side `size` (target pixels).
 pub fn draw(target: &mut PixmapMut, action: Action, x: f32, y: f32, size: f32, color: Color) {
+    draw_ops(target, ops(action), x, y, size, color);
+}
+
+fn draw_ops(target: &mut PixmapMut, ops: Vec<Op>, x: f32, y: f32, size: f32, color: Color) {
     let s = size / 24.0;
     let t = Transform::from_row(s, 0.0, 0.0, s, x, y);
     let mut paint = Paint::default();
     paint.set_color(color.to_skia());
     paint.anti_alias = true;
-    for op in ops(action) {
+    for op in ops {
         match op {
             Op::Stroke(path, w) => {
                 let stroke = Stroke { width: w, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Default::default() };

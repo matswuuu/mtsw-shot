@@ -117,7 +117,8 @@ enum Drag {
     Drawing { ann: Annotation, anchor: Point },
     /// Right button held with the color wheel open.
     Wheel,
-    Slider,
+    /// Dragging one of the side panel controls.
+    Panel(PanelControl),
 }
 
 struct TextEdit {
@@ -152,6 +153,12 @@ pub struct Editor {
     text: Option<TextEdit>,
     wheel: Option<Point>,
     side_panel: bool,
+    /// Hue/saturation/value of `color`, kept separately so the hue survives grays.
+    hsv: [f32; 3],
+    /// Eyedropper mode: the next left click picks a color from the screen.
+    picking: bool,
+    /// Hex color being typed into the side panel.
+    hex_edit: Option<String>,
     flash_until: Option<Instant>,
     last_click: Option<(Instant, Point)>,
     accept_on_select: bool,
@@ -201,6 +208,9 @@ impl Editor {
             text: None,
             wheel: None,
             side_panel: cfg.ui.show_side_panel,
+            hsv: rgb_to_hsv(color),
+            picking: false,
+            hex_edit: None,
             flash_until: None,
             last_click: None,
             accept_on_select,
@@ -366,7 +376,15 @@ impl Editor {
                 let i = self.pointer_output.unwrap_or(0);
                 self.selection = Some(self.shot.output_canvas_rect(i).round());
             }
-            ToggleSidePanel => self.side_panel = !self.side_panel,
+            ToggleSidePanel => {
+                self.side_panel = !self.side_panel;
+                self.hex_edit = None;
+            }
+            PickColor => {
+                self.commit_text();
+                self.wheel = None;
+                self.picking = !self.picking;
+            }
             MoveLeft => self.nudge(Point::new(-1.0, 0.0), false),
             MoveRight => self.nudge(Point::new(1.0, 0.0), false),
             MoveUp => self.nudge(Point::new(0.0, -1.0), false),
@@ -410,6 +428,9 @@ impl Editor {
 
     pub fn key(&mut self, key: &KeyPress) {
         self.shift = key.mods.shift;
+        if self.hex_edit.is_some() && self.hex_key(key) {
+            return;
+        }
         if self.text.is_some() && self.text_key(key) {
             return;
         }
@@ -419,6 +440,10 @@ impl Editor {
                 if self.wheel.take().is_some() {
                     return;
                 }
+                if self.picking {
+                    self.picking = false;
+                    return;
+                }
                 if !matches!(self.drag, Drag::None) {
                     self.drag = Drag::None;
                     return;
@@ -426,6 +451,49 @@ impl Editor {
             }
             self.perform(action);
         }
+    }
+
+    /// Handles a key while typing a hex color. Returns true if the key was consumed.
+    fn hex_key(&mut self, key: &KeyPress) -> bool {
+        let has = |n: &str| key.names.iter().any(|k| k == n);
+        if key.mods.ctrl || key.mods.alt {
+            return false;
+        }
+        let buf = self.hex_edit.as_mut().unwrap();
+        if has("escape") {
+            self.hex_edit = None;
+        } else if has("return") || has("kp_enter") {
+            let text = self.hex_edit.take().unwrap();
+            match Color::parse(&format!("#{text}")) {
+                Some(c) => self.set_color(c),
+                None => self.show_message(format!("Invalid color #{text}")),
+            }
+        } else if has("backspace") {
+            buf.pop();
+        } else if let Some(t) = &key.text {
+            for c in t.chars().filter(|c| c.is_ascii_hexdigit()) {
+                if buf.len() < 8 {
+                    buf.push(c.to_ascii_lowercase());
+                }
+            }
+        }
+        // Swallow everything else so tool shortcuts don't fire while typing.
+        true
+    }
+
+    /// Sets the drawing color from outside the HSV controls.
+    fn set_color(&mut self, c: Color) {
+        self.color = c;
+        let [h, s, v] = rgb_to_hsv(c);
+        // Grays and black have no hue; keep the previous one so the hue bar doesn't jump.
+        let h = if s == 0.0 || v == 0.0 { self.hsv[0] } else { h };
+        let s = if v == 0.0 { self.hsv[1] } else { s };
+        self.hsv = [h, s, v];
+    }
+
+    fn set_hsv(&mut self, hsv: [f32; 3]) {
+        self.hsv = hsv;
+        self.color = hsv_to_rgb(hsv).with_alpha(self.color.a);
     }
 
     /// Handles a key while editing text. Returns true if the key was consumed.
@@ -495,7 +563,10 @@ impl Editor {
                 self.selection = r.round().intersect(&bounds);
             }
             Drag::Drawing { ann, anchor } => update_shape(&mut ann.shape, *anchor, p, shift),
-            Drag::Slider => self.slider_set(p),
+            Drag::Panel(control) => {
+                let control = *control;
+                self.panel_drag(control, p);
+            }
         }
     }
 
@@ -516,6 +587,15 @@ impl Editor {
     }
 
     fn press(&mut self, button: u32, p: Point) {
+        if self.picking {
+            if button == BTN_LEFT {
+                if let Some(c) = self.pixel_color(p) {
+                    self.set_color(c);
+                }
+            }
+            self.picking = false;
+            return;
+        }
         if button == BTN_RIGHT {
             if !matches!(self.drag, Drag::None) {
                 return;
@@ -532,22 +612,35 @@ impl Editor {
         }
         if let Some(center) = self.wheel.take() {
             if let Some(c) = self.wheel_hit(center, p) {
-                self.color = self.cfg.colors.palette[c];
+                self.set_color(self.cfg.colors.palette[c]);
+            } else if center.dist(p) <= WHEEL_CENTER * self.ui() {
+                // The center opens the full color picker.
+                self.side_panel = true;
             }
             return;
         }
-        if self.side_panel
-            && let Some(hit) = self.panel_hit(p) {
-                match hit {
-                    PanelHit::Color(c) => self.color = c,
-                    PanelHit::Slider => {
-                        self.drag = Drag::Slider;
-                        self.slider_set(p);
-                    }
-                    PanelHit::Other => {}
+        let hit = if self.side_panel { self.panel_hit(p) } else { None };
+        if self.hex_edit.is_some() && hit != Some(PanelHit::Hex) {
+            self.hex_edit = None;
+        }
+        if let Some(hit) = hit {
+            match hit {
+                PanelHit::Color(c) => self.set_color(c),
+                PanelHit::Control(control) => {
+                    self.drag = Drag::Panel(control);
+                    self.panel_drag(control, p);
                 }
-                return;
+                PanelHit::Hex => {
+                    if self.hex_edit.is_none() {
+                        self.commit_text();
+                        self.hex_edit = Some(String::new());
+                    }
+                }
+                PanelHit::Pick => self.picking = true,
+                PanelHit::Other => {}
             }
+            return;
+        }
         if let Some(action) = self.button_at(p) {
             self.perform(action);
             return;
@@ -623,7 +716,7 @@ impl Editor {
             if let (Drag::Wheel, Some(center)) = (&self.drag, self.wheel) {
                 self.drag = Drag::None;
                 if let Some(c) = self.wheel_hit(center, p) {
-                    self.color = self.cfg.colors.palette[c];
+                    self.set_color(self.cfg.colors.palette[c]);
                     self.wheel = None;
                 } else if center.dist(p) > 4.0 * self.ui() {
                     // Dragged away without choosing: close.
@@ -672,8 +765,14 @@ impl Editor {
             Drag::Moving { .. } => return CursorKind::Grabbing,
             Drag::Resizing { handle, .. } => return handle.cursor(),
             Drag::Creating { .. } | Drag::Drawing { .. } => return CursorKind::Crosshair,
-            Drag::Wheel | Drag::Slider => return CursorKind::Pointer,
+            Drag::Wheel | Drag::Panel(_) => return CursorKind::Pointer,
             Drag::None => {}
+        }
+        if self.picking {
+            return CursorKind::Crosshair;
+        }
+        if self.side_panel && self.panel_hit(p) == Some(PanelHit::Hex) {
+            return CursorKind::Text;
         }
         if self.wheel.is_some() || self.button_at(p).is_some() || (self.side_panel && self.panel_hit(p).is_some()) {
             return CursorKind::Pointer;
@@ -744,7 +843,7 @@ impl Editor {
 
     fn toolbar_visible(&self) -> bool {
         self.selection.is_some_and(|s| !s.is_empty())
-            && matches!(self.drag, Drag::None | Drag::Drawing { .. } | Drag::Wheel | Drag::Slider)
+            && matches!(self.drag, Drag::None | Drag::Drawing { .. } | Drag::Wheel | Drag::Panel(_))
     }
 
     /// Toolbar buttons as (action, square) pairs.
@@ -806,20 +905,30 @@ impl Editor {
         self.wheel_geometry(center).iter().position(|(c, r)| c.dist(p) <= r * 1.25)
     }
 
-    fn panel_rect(&self) -> Rect {
+    /// Side panel geometry in canvas coordinates, on the output under the pointer.
+    fn panel_layout(&self) -> PanelLayout {
         let i = self.pointer_output.unwrap_or(0);
         let out = self.shot.output_canvas_rect(i);
         let u = self.ui();
-        Rect::new(out.x + 12.0 * u, out.y + 12.0 * u + out.h * 0.15, 220.0 * u, 300.0 * u)
-    }
+        let (x0, y0) = (out.x + 12.0 * u, out.y + 12.0 * u + out.h * 0.1);
+        let pad = 14.0 * u;
+        let inner_w = 208.0 * u;
+        let x = x0 + pad;
+        let mut y = y0 + pad;
 
-    fn panel_layout(&self) -> (Vec<(Color, Rect)>, Rect) {
-        let u = self.ui();
-        let panel = self.panel_rect();
-        let sw = 26.0 * u;
-        let gap = 6.0 * u;
-        let cols = 6;
-        let top = panel.y + 70.0 * u;
+        let preview = Rect::new(x, y, 40.0 * u, 40.0 * u);
+        let pick = Rect::new(x + inner_w - 30.0 * u, y + 5.0 * u, 30.0 * u, 30.0 * u);
+        let hex = Rect::new(preview.right() + 8.0 * u, y + 2.0 * u, pick.x - preview.right() - 16.0 * u, 22.0 * u);
+        y = preview.bottom() + 12.0 * u;
+
+        let sv = Rect::new(x, y, inner_w, 130.0 * u);
+        y = sv.bottom() + 10.0 * u;
+        let hue = Rect::new(x, y, inner_w, 14.0 * u);
+        y = hue.bottom() + 10.0 * u;
+        let alpha = Rect::new(x, y, inner_w, 14.0 * u);
+        y = alpha.bottom() + 14.0 * u;
+
+        let (sw, gap, cols) = (29.0 * u, 6.8 * u, 6);
         let swatches = self
             .cfg
             .colors
@@ -827,37 +936,72 @@ impl Editor {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let (col, row) = (i % cols, i / cols);
-                (*c, Rect::new(panel.x + 14.0 * u + col as f32 * (sw + gap), top + row as f32 * (sw + gap), sw, sw))
+                let (col, row) = ((i % cols) as f32, (i / cols) as f32);
+                (*c, Rect::new(x + col * (sw + gap), y + row * (sw + gap), sw, sw))
             })
             .collect::<Vec<_>>();
         let rows = self.cfg.colors.palette.len().div_ceil(cols) as f32;
-        let slider = Rect::new(panel.x + 14.0 * u, top + rows * (sw + gap) + 40.0 * u, panel.w - 28.0 * u, 18.0 * u);
-        (swatches, slider)
+        y += rows * (sw + gap) + 30.0 * u;
+
+        let thickness = Rect::new(x, y, inner_w, 18.0 * u);
+        y = thickness.bottom() + 34.0 * u;
+        let panel = Rect::new(x0, y0, inner_w + 2.0 * pad, y - y0);
+        PanelLayout { panel, preview, hex, pick, sv, hue, alpha, swatches, thickness }
     }
 
     fn panel_hit(&self, p: Point) -> Option<PanelHit> {
-        let panel = self.panel_rect();
-        if !panel.contains(p) {
+        let l = self.panel_layout();
+        if !l.panel.contains(p) {
             return None;
         }
-        let (swatches, slider) = self.panel_layout();
-        if let Some((c, _)) = swatches.iter().find(|(_, r)| r.contains(p)) {
+        let grab = 5.0 * self.ui();
+        if let Some((c, _)) = l.swatches.iter().find(|(_, r)| r.contains(p)) {
             return Some(PanelHit::Color(*c));
         }
-        if slider.inflate(6.0 * self.ui()).contains(p) {
-            return Some(PanelHit::Slider);
-        }
-        Some(PanelHit::Other)
+        let hit = if l.pick.contains(p) {
+            PanelHit::Pick
+        } else if l.hex.inflate(grab).contains(p) {
+            PanelHit::Hex
+        } else if l.sv.inflate(grab).contains(p) {
+            PanelHit::Control(PanelControl::SatValue)
+        } else if l.hue.inflate(grab).contains(p) {
+            PanelHit::Control(PanelControl::Hue)
+        } else if l.alpha.inflate(grab).contains(p) {
+            PanelHit::Control(PanelControl::Alpha)
+        } else if l.thickness.inflate(grab).contains(p) {
+            PanelHit::Control(PanelControl::Thickness)
+        } else {
+            PanelHit::Other
+        };
+        Some(hit)
     }
 
-    fn slider_set(&mut self, p: Point) {
-        let (_, slider) = self.panel_layout();
-        let f = ((p.x - slider.x) / slider.w).clamp(0.0, 1.0);
-        let d = &self.cfg.drawing;
-        // Quadratic mapping gives finer control over thin strokes.
-        self.thickness = (d.min_thickness + f * f * (d.max_thickness - d.min_thickness)).round().max(d.min_thickness);
-        self.flash_until = Some(Instant::now() + FLASH);
+    fn panel_drag(&mut self, control: PanelControl, p: Point) {
+        let l = self.panel_layout();
+        let fx = |r: Rect| ((p.x - r.x) / r.w).clamp(0.0, 1.0);
+        let fy = |r: Rect| ((p.y - r.y) / r.h).clamp(0.0, 1.0);
+        match control {
+            PanelControl::SatValue => self.set_hsv([self.hsv[0], fx(l.sv), 1.0 - fy(l.sv)]),
+            PanelControl::Hue => self.set_hsv([fx(l.hue) * 360.0, self.hsv[1], self.hsv[2]]),
+            PanelControl::Alpha => self.color = self.color.with_alpha((fx(l.alpha) * 255.0).round() as u8),
+            PanelControl::Thickness => {
+                let f = fx(l.thickness);
+                let d = &self.cfg.drawing;
+                // Quadratic mapping gives finer control over thin strokes.
+                self.thickness =
+                    (d.min_thickness + f * f * (d.max_thickness - d.min_thickness)).round().max(d.min_thickness);
+                self.flash_until = Some(Instant::now() + FLASH);
+            }
+        }
+    }
+
+    /// Color of the screenshot (with annotations) at a canvas point.
+    fn pixel_color(&self, p: Point) -> Option<Color> {
+        if p.x < 0.0 || p.y < 0.0 {
+            return None;
+        }
+        let c = self.composite.pixel(p.x as u32, p.y as u32)?.demultiply();
+        Some(Color::rgb(c.red(), c.green(), c.blue()))
     }
 
     fn text_bounds(&self, t: &TextEdit) -> Rect {
@@ -973,19 +1117,24 @@ impl Editor {
                     stroke_circle(target, c, r + 4.0 * u, self.cfg.colors.ui, 2.0 * u);
                 }
             }
+            // The center shows the current color; clicking it opens the full picker.
             let c = to(center);
-            fill_circle(target, c, 9.0 * u, self.color);
-            stroke_circle(target, c, 9.0 * u, Color::rgb(255, 255, 255), 2.0 * u);
+            let r = WHEEL_CENTER * u;
+            fill_circle(target, c, r, self.color);
+            stroke_circle(target, c, r, Color::rgb(255, 255, 255), 2.0 * u);
+            let fg = self.color.contrasting();
+            fill_rect(target, Rect::new(c.x - r * 0.45, c.y - 1.0 * u, r * 0.9, 2.0 * u), fg);
+            fill_rect(target, Rect::new(c.x - 1.0 * u, c.y - r * 0.45, 2.0 * u, r * 0.9), fg);
         }
 
         if self.side_panel && self.pointer_output.unwrap_or(0) == idx {
             self.render_panel(target, &to_rect, u);
         }
 
-        if self.cfg.ui.show_magnifier
-            && self.pointer_output == Some(idx)
-            && (sel.is_none() || matches!(self.drag, Drag::Creating { .. } | Drag::Resizing { .. }))
-        {
+        let show_magnifier = self.picking
+            || (self.cfg.ui.show_magnifier
+                && (sel.is_none() || matches!(self.drag, Drag::Creating { .. } | Drag::Resizing { .. })));
+        if show_magnifier && self.pointer_output == Some(idx) && !(self.side_panel && self.panel_hit(self.pointer).is_some()) {
             self.render_magnifier(target, to(self.pointer), k, u);
         }
 
@@ -1044,39 +1193,106 @@ impl Editor {
     }
 
     fn render_panel(&self, target: &mut PixmapMut, to_rect: &dyn Fn(Rect) -> Rect, u: f32) {
-        let panel = to_rect(self.panel_rect());
-        fill_round_rect(target, panel, 10.0 * u, self.cfg.colors.label_background);
+        let l = self.panel_layout();
         let fs = self.cfg.ui.font_size * u;
         let text = self.cfg.colors.label_text;
-        // Current color preview.
-        let pv = Rect::new(panel.x + 14.0 * u, panel.y + 14.0 * u, 40.0 * u, 40.0 * u);
-        fill_round_rect(target, pv, 6.0 * u, self.color);
-        stroke_rect(target, pv, Color::rgb(255, 255, 255), 1.0 * u, None);
-        self.text_at(target, &self.color.to_string(), Point::new(pv.right() + 10.0 * u, pv.y + 2.0 * u), fs, text);
-        let tool = self.tool.map(|t| t.tooltip()).unwrap_or("Select / move");
-        self.text_at(target, tool, Point::new(pv.right() + 10.0 * u, pv.y + 2.0 * u + fs * 1.3), fs * 0.9, text.with_alpha(200));
+        let white = Color::rgb(255, 255, 255);
+        fill_round_rect(target, to_rect(l.panel), 10.0 * u, self.cfg.colors.label_background);
 
-        let (swatches, slider) = self.panel_layout();
-        for (c, r) in swatches {
-            let r = to_rect(r);
-            fill_round_rect(target, r, 5.0 * u, c);
-            if c == self.color {
-                stroke_rect(target, r.inflate(2.5 * u), Color::rgb(255, 255, 255), 2.0 * u, None);
+        // Preview (over a checkerboard so transparency is visible).
+        let pv = to_rect(l.preview);
+        fill_gradient(target, pv, |x, y| checker(x, y, pv, 6.0 * u).blend(self.color));
+        stroke_rect(target, pv, white, 1.0 * u, None);
+
+        // Hex field.
+        let hex = to_rect(l.hex);
+        let editing = self.hex_edit.is_some();
+        let hex_text = match &self.hex_edit {
+            Some(buf) => format!("#{buf}"),
+            None => self.color.to_string(),
+        };
+        if editing {
+            fill_round_rect(target, hex, 4.0 * u, Color::rgba(255, 255, 255, 30));
+            stroke_rect(target, hex, self.cfg.colors.ui, 1.5 * u, None);
+        }
+        let tp = Point::new(hex.x + 4.0 * u, hex.y + (hex.h - fs * 1.2) / 2.0);
+        self.text_at(target, &hex_text, tp, fs, text);
+        if editing && let Some(f) = &self.font {
+            let cx = tp.x + f.prefix_width(&hex_text, hex_text.chars().count(), fs);
+            fill_rect(target, Rect::new(cx + 1.0 * u, hex.y + 4.0 * u, (1.5 * u).round(), hex.h - 8.0 * u), text);
+        }
+        let hint = if editing { "Enter: apply · Esc: cancel" } else { "click to type a hex color" };
+        self.text_at(target, hint, Point::new(hex.x + 4.0 * u, hex.bottom() + 1.0 * u), fs * 0.75, text.with_alpha(150));
+
+        // Eyedropper.
+        let pick = to_rect(l.pick);
+        let active = self.picking;
+        fill_round_rect(target, pick, 6.0 * u, if active { white } else { self.cfg.colors.ui });
+        let is = pick.w * 0.7;
+        icons::draw_eyedropper(
+            target,
+            pick.center().x - is / 2.0,
+            pick.center().y - is / 2.0,
+            is,
+            if active { self.cfg.colors.ui } else { self.cfg.colors.icon },
+        );
+
+        // Saturation/value square for the current hue.
+        let [h, s, v] = self.hsv;
+        let sv = to_rect(l.sv);
+        fill_gradient(target, sv, |x, y| hsv_to_rgb([h, (x - sv.x) / sv.w, 1.0 - (y - sv.y) / sv.h]));
+        stroke_rect(target, sv, white.with_alpha(120), 1.0 * u, None);
+        let m = Point::new(sv.x + s * sv.w, sv.y + (1.0 - v) * sv.h);
+        stroke_circle(target, m, 6.0 * u, Color::rgb(0, 0, 0), 3.0 * u);
+        stroke_circle(target, m, 6.0 * u, white, 1.5 * u);
+
+        // Hue bar.
+        let hue = to_rect(l.hue);
+        fill_gradient(target, hue, |x, _| hsv_to_rgb([(x - hue.x) / hue.w * 360.0, 1.0, 1.0]));
+        slider_knob(target, Point::new(hue.x + h / 360.0 * hue.w, hue.center().y), hue.h, u);
+
+        // Opacity bar.
+        let al = to_rect(l.alpha);
+        let opaque = self.color.with_alpha(255);
+        fill_gradient(target, al, |x, y| {
+            let a = ((x - al.x) / al.w * 255.0).round() as u8;
+            checker(x, y, al, al.h / 2.0).blend(opaque.with_alpha(a))
+        });
+        slider_knob(target, Point::new(al.x + self.color.a as f32 / 255.0 * al.w, al.center().y), al.h, u);
+        self.text_at(
+            target,
+            &format!("Opacity {}%", (self.color.a as f32 / 2.55).round() as i64),
+            Point::new(al.x, al.bottom() + 1.0 * u),
+            fs * 0.75,
+            text.with_alpha(150),
+        );
+
+        // Palette.
+        for (c, r) in &l.swatches {
+            let r = to_rect(*r);
+            fill_round_rect(target, r, 5.0 * u, *c);
+            if *c == self.color {
+                stroke_rect(target, r.inflate(2.5 * u), white, 2.0 * u, None);
             }
         }
-        let s = to_rect(slider);
-        self.text_at(target, &format!("Thickness: {}", self.thickness.round() as i64), Point::new(s.x, s.y - fs * 1.6), fs, text);
-        let track = Rect::new(s.x, s.center().y - 2.0 * u, s.w, 4.0 * u);
+
+        // Thickness.
+        let t = to_rect(l.thickness);
+        self.text_at(target, &format!("Thickness: {}", self.thickness.round() as i64), Point::new(t.x, t.y - fs * 1.5), fs, text);
+        let track = Rect::new(t.x, t.center().y - 2.0 * u, t.w, 4.0 * u);
         fill_round_rect(target, track, 2.0 * u, Color::rgba(255, 255, 255, 90));
         let d = &self.cfg.drawing;
         let f = ((self.thickness - d.min_thickness) / (d.max_thickness - d.min_thickness).max(1e-3)).clamp(0.0, 1.0).sqrt();
-        fill_round_rect(target, Rect::new(s.x, track.y, s.w * f, track.h), 2.0 * u, self.cfg.colors.ui);
-        fill_circle(target, Point::new(s.x + s.w * f, s.center().y), 8.0 * u, Color::rgb(255, 255, 255));
+        fill_round_rect(target, Rect::new(t.x, track.y, t.w * f, track.h), 2.0 * u, self.cfg.colors.ui);
+        fill_circle(target, Point::new(t.x + t.w * f, t.center().y), 8.0 * u, white);
+
+        let panel = to_rect(l.panel);
+        let key = |a: Action| self.shortcuts.describe(a).unwrap_or_else(|| "-".into());
         self.text_at(
             target,
-            "Space: hide panel",
-            Point::new(panel.x + 14.0 * u, panel.bottom() - fs * 1.8),
-            fs * 0.85,
+            &format!("{}: hide panel   {}: eyedropper", key(Action::ToggleSidePanel), key(Action::PickColor)),
+            Point::new(panel.x + 14.0 * u, panel.bottom() - fs * 1.7),
+            fs * 0.8,
             text.with_alpha(170),
         );
     }
@@ -1129,7 +1345,7 @@ impl Editor {
         let lines = [
             "Drag to select a region, click to select a window or screen".to_string(),
             format!("{}: accept    {}: cancel    {}: copy    {}: save", key(Action::Accept), key(Action::Exit), key(Action::Copy), key(Action::Save)),
-            format!("Right click: color    Scroll: thickness    {}: side panel", key(Action::ToggleSidePanel)),
+            format!("Right click: colors    {}: eyedropper    Scroll: thickness    {}: side panel", key(Action::PickColor), key(Action::ToggleSidePanel)),
             format!("{}: undo    {}: redo    {}: select screen", key(Action::Undo), key(Action::Redo), key(Action::SelectScreen)),
         ];
         let text = lines.join("\n");
@@ -1162,10 +1378,109 @@ impl Editor {
     }
 }
 
+/// Radius (logical px) of the center button of the color wheel.
+const WHEEL_CENTER: f32 = 12.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelControl {
+    SatValue,
+    Hue,
+    Alpha,
+    Thickness,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum PanelHit {
     Color(Color),
-    Slider,
+    Control(PanelControl),
+    Hex,
+    Pick,
     Other,
+}
+
+struct PanelLayout {
+    panel: Rect,
+    preview: Rect,
+    hex: Rect,
+    pick: Rect,
+    sv: Rect,
+    hue: Rect,
+    alpha: Rect,
+    swatches: Vec<(Color, Rect)>,
+    thickness: Rect,
+}
+
+/// `[hue 0..360, saturation 0..1, value 0..1]`
+fn rgb_to_hsv(c: Color) -> [f32; 3] {
+    let (r, g, b) = (c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0);
+    let max = r.max(g).max(b);
+    let d = max - r.min(g).min(b);
+    let h = if d == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    [h, if max == 0.0 { 0.0 } else { d / max }, max]
+}
+
+fn hsv_to_rgb([h, s, v]: [f32; 3]) -> Color {
+    let (s, v) = (s.clamp(0.0, 1.0), v.clamp(0.0, 1.0));
+    let c = v * s;
+    let hp = h.rem_euclid(360.0) / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    let to = |f: f32| ((f + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Color::rgb(to(r), to(g), to(b))
+}
+
+impl Color {
+    /// Source-over of `top` onto this opaque color.
+    fn blend(self, top: Color) -> Color {
+        let a = top.a as f32 / 255.0;
+        let mix = |b: u8, t: u8| (t as f32 * a + b as f32 * (1.0 - a)).round() as u8;
+        Color::rgb(mix(self.r, top.r), mix(self.g, top.g), mix(self.b, top.b))
+    }
+}
+
+/// Light/dark checkerboard used behind translucent colors.
+fn checker(x: f32, y: f32, r: Rect, cell: f32) -> Color {
+    let cell = cell.max(1.0);
+    let odd = (((x - r.x) / cell) as i32 + ((y - r.y) / cell) as i32) % 2 == 1;
+    if odd { Color::rgb(200, 200, 200) } else { Color::rgb(255, 255, 255) }
+}
+
+/// Fills a rect pixel by pixel with an opaque color function of the pixel center.
+fn fill_gradient(target: &mut PixmapMut, r: Rect, f: impl Fn(f32, f32) -> Color) {
+    let (tw, th) = (target.width() as i32, target.height() as i32);
+    let x0 = (r.x.round() as i32).clamp(0, tw);
+    let x1 = (r.right().round() as i32).clamp(0, tw);
+    let y0 = (r.y.round() as i32).clamp(0, th);
+    let y1 = (r.bottom().round() as i32).clamp(0, th);
+    let px = target.pixels_mut();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let c = f(x as f32 + 0.5, y as f32 + 0.5);
+            px[(y * tw + x) as usize] = tiny_skia::PremultipliedColorU8::from_rgba(c.r, c.g, c.b, 255).unwrap();
+        }
+    }
+}
+
+fn slider_knob(target: &mut PixmapMut, c: Point, h: f32, u: f32) {
+    let r = Rect::new(c.x - 3.0 * u, c.y - h / 2.0 - 3.0 * u, 6.0 * u, h + 6.0 * u);
+    fill_round_rect(target, r.inflate(1.0 * u), 3.0 * u, Color::rgb(0, 0, 0));
+    fill_round_rect(target, r, 3.0 * u, Color::rgb(255, 255, 255));
 }
 
 /// Draws an annotation into a canvas-space pixmap, using the pixmap itself as the source
@@ -1455,6 +1770,70 @@ mod tests {
         }
         ed.button(BTN_LEFT, false);
         ed.render(&mut pix.as_mut(), 0);
+    }
+
+    #[test]
+    fn hsv_roundtrip() {
+        for c in [Color::rgb(255, 0, 0), Color::rgb(12, 200, 99), Color::rgb(128, 128, 128), Color::rgb(0, 0, 0), Color::rgb(250, 3, 251)] {
+            assert_eq!(hsv_to_rgb(rgb_to_hsv(c)), c);
+        }
+    }
+
+    #[test]
+    fn any_color_can_be_selected() {
+        let cfg = Config::default();
+        let mut ed = Editor::new(&cfg, fake_shot(), vec![], Color::rgb(255, 0, 0), 3.0, None, None, false, None);
+        drag(&mut ed, Point::new(300.0, 150.0), Point::new(1100.0, 600.0));
+        let key = |text: Option<&str>, names: &[&str]| KeyPress {
+            mods: Default::default(),
+            names: names.iter().map(|s| s.to_string()).collect(),
+            text: text.map(String::from),
+            repeats: true,
+        };
+
+        // Clicking the center of the right-click wheel opens the picker.
+        ed.pointer_motion(Point::new(700.0, 400.0), Some(0));
+        ed.button(BTN_RIGHT, true);
+        ed.button(BTN_RIGHT, false);
+        ed.button(BTN_LEFT, true);
+        ed.button(BTN_LEFT, false);
+        assert!(ed.side_panel);
+        let l = ed.panel_layout();
+
+        // Hue to cyan (180°), then full saturation/value.
+        drag(&mut ed, l.hue.center(), Point::new(l.hue.x + l.hue.w * 0.5, l.hue.center().y));
+        drag(&mut ed, Point::new(l.sv.right() - 1.0, l.sv.y + 1.0), Point::new(l.sv.right() + 20.0, l.sv.y - 20.0));
+        assert_eq!(ed.color, Color::rgb(0, 255, 255));
+        // Half opacity.
+        drag(&mut ed, l.alpha.center(), l.alpha.center());
+        assert!((127..=128).contains(&ed.color.a));
+
+        // Typing a hex value; tool shortcuts must not fire meanwhile.
+        ed.pointer_motion(l.hex.center(), Some(0));
+        ed.button(BTN_LEFT, true);
+        ed.button(BTN_LEFT, false);
+        ed.key(&key(Some("1"), &["1"]));
+        ed.key(&key(Some("p"), &["p"])); // not hex: ignored, and not the pencil shortcut
+        for ch in ["2", "a", "B", "c", "D"] {
+            ed.key(&key(Some(ch), &[]));
+        }
+        assert_eq!(ed.tool, None);
+        render(&ed, "6-hex-edit.png");
+        ed.key(&key(None, &["return"]));
+        assert_eq!(ed.color, Color::rgb(0x12, 0xab, 0xcd));
+        assert_eq!(ed.hex_edit, None);
+        render(&ed, "7-picker.png");
+
+        // Eyedropper picks from the screenshot.
+        ed.perform(Action::PickColor);
+        let p = Point::new(640.0, 600.0);
+        ed.pointer_motion(p, Some(0));
+        render(&ed, "8-eyedropper.png");
+        ed.button(BTN_LEFT, true);
+        ed.button(BTN_LEFT, false);
+        assert!(!ed.picking);
+        assert_eq!(ed.color, ed.pixel_color(p).unwrap());
+        assert_eq!(ed.annotations.len(), 0, "picking must not draw");
     }
 
     #[test]
